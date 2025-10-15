@@ -1,0 +1,169 @@
+///////////////////////////////////////////////////////////////////////////////
+// File: ZdcSD.cc
+// Date: 03.01
+// Description: Sensitive Detector class for Zdc
+// Modifications:
+///////////////////////////////////////////////////////////////////////////////
+#include <memory>
+
+#include "SimG4CMS/Forward/interface/ZdcSD.h"
+#include "SimG4CMS/Forward/interface/ForwardName.h"
+#include "FWCore/MessageLogger/interface/MessageLogger.h"
+#include "FWCore/ParameterSet/interface/ParameterSet.h"
+#include "Geometry/Records/interface/IdealGeometryRecord.h"
+#include "SimG4Core/Notification/interface/G4TrackToParticleID.h"
+#include "SimG4Core/Notification/interface/TrackInformation.h"
+#include "SimG4CMS/Forward/interface/ZdcNumberingScheme.h"
+#include "DataFormats/HcalDetId/interface/HcalZDCDetId.h"
+
+#include "G4SDManager.hh"
+#include "G4Step.hh"
+#include "G4Track.hh"
+#include "G4VProcess.hh"
+#include "G4ios.hh"
+#include "G4Cerenkov.hh"
+#include "G4ParticleTable.hh"
+#include "G4PhysicalConstants.hh"
+#include <CLHEP/Units/SystemOfUnits.h>
+#include <CLHEP/Units/GlobalPhysicalConstants.h>
+#include "Randomize.hh"
+#include "G4Poisson.hh"
+#include "G4TwoVector.hh"
+
+using namespace std;
+using namespace edm;
+
+//#define EDM_ML_DEBUG
+
+ZdcSD::ZdcSD(const string& name,
+	     const SensitiveDetectorCatalog& clg,
+	     edm::ParameterSet const& p,
+	     const SimTrackManager* manager)
+    : CaloSD(name, clg, p, manager) {
+  edm::ParameterSet m_ZdcSD = p.getParameter<edm::ParameterSet>("ZdcSD");
+  useShowerLibrary = m_ZdcSD.getParameter<bool>("UseShowerLibrary");
+  useShowerHits = m_ZdcSD.getParameter<bool>("UseShowerHits");
+  zdcHitEnergyCut = m_ZdcSD.getParameter<double>("ZdcHitEnergyCut") * CLHEP::GeV;
+  thFibDir = m_ZdcSD.getParameter<double>("FiberDirection");
+  verbosity = m_ZdcSD.getParameter<int>("Verbosity");
+  int verbn = verbosity / 10;
+  verbosity %= 10;
+  numberingScheme = make_unique<ZdcNumberingScheme>(verbn);
+
+  gain=0.3;
+
+  if (useShowerLibrary) {
+    showerLibrary = make_unique<ZdcShowerLibrary>(name, p);
+    setParameterized(true);
+    Cherenkov.reset(nullptr);
+  } else {
+    showerLibrary.reset(nullptr);
+    Cherenkov = make_unique<ZdcCherenkov>(p);
+  }
+}
+//====================================================================================================
+void ZdcSD::initRun() {
+  if (useShowerLibrary) {
+    G4ParticleTable* theParticleTable = G4ParticleTable::GetParticleTable();
+    showerLibrary->initRun(theParticleTable);
+  }
+  hits.clear();
+}
+//====================================================================================================
+  
+bool ZdcSD::ProcessHits(G4Step* aStep, G4TouchableHistory*) {
+ if (useShowerLibrary) {
+    getFromLibrary(aStep);
+  }
+//====================================================================================================
+  if (useShowerHits) {
+    // check unitID
+    unsigned int unitID = setDetUnitId(aStep);
+    if (unitID == 0)
+      return false;
+    auto const theTrack = aStep->GetTrack();
+    uint16_t depth = getDepth(aStep);
+
+    double time = theTrack->GetGlobalTime() / CLHEP::nanosecond;
+    int primaryID = getTrackID(theTrack);
+    currentID[0].setID(unitID, time, primaryID, depth);
+    int npe=Cherenkov->computeNPE(aStep);
+    double energy = npe;                      // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    // Russian Roulette
+    double wt2 = theTrack->GetWeight();
+    if (wt2 > 0.0) {
+      energy *= wt2;
+    }
+
+    if (G4TrackToParticleID::isGammaElectronPositron(theTrack)) {
+      edepositEM = energy;
+      edepositHAD = 0;
+    } else {
+      edepositEM = 0;
+      edepositHAD = energy;
+    }
+//    uint32_t id = unitID;
+    if(energy > 0.) {
+
+       if (!hitExists(aStep, 0) && energy > 0.) {
+       currentHit[0] = CaloSD::createNewHit(aStep, theTrack, 0);
+       } else {
+       }
+    }
+  }
+  return true;
+}
+//====================================================================================================
+
+bool ZdcSD::getFromLibrary(const G4Step* aStep) {
+  bool ok = true;
+
+  auto const preStepPoint = aStep->GetPreStepPoint();
+
+  double etrack = preStepPoint->GetKineticEnergy();
+  int primaryID = setTrackID(aStep);
+
+  hits.clear();
+
+  // Reset entry point for new primary
+  resetForNewPrimary(aStep);
+
+  if (etrack >= zdcHitEnergyCut) {
+    // create hits only if above threshold
+
+    hits.swap(showerLibrary.get()->getHits(aStep, ok));
+  }
+
+  incidentEnergy = etrack;
+  entrancePoint = preStepPoint->GetPosition();
+  for (unsigned int i = 0; i < hits.size(); i++) {
+    posGlobal = hits[i].position;
+    entranceLocal = hits[i].entryLocal;
+    double time = hits[i].time;
+    unsigned int unitID = hits[i].detID;
+    edepositHAD = hits[i].DeHad;
+    edepositEM = hits[i].DeEM;
+    currentID[0].setID(unitID, time, primaryID, 0);
+    processHit(aStep);
+
+  }
+  return ok;
+}
+/////////////////////////////////////////////////////////////////////
+
+uint32_t ZdcSD::setDetUnitId(const G4Step* aStep) {
+  return (numberingScheme == nullptr ? 0 : numberingScheme->getUnitID(aStep));
+}
+
+int ZdcSD::setTrackID(const G4Step* aStep) {
+  auto const theTrack = aStep->GetTrack();
+  TrackInformation* trkInfo = (TrackInformation*)(theTrack->GetUserInformation());
+  int primaryID = trkInfo->getIDonCaloSurface();
+  if (primaryID == 0) {
+    primaryID = theTrack->GetTrackID();
+  }
+  if (primaryID != previousID[0].trackID())
+    resetForNewPrimary(aStep);
+  return primaryID;
+}

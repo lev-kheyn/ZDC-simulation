@@ -1,0 +1,206 @@
+#include "SimG4CMS/Forward/interface/ZdcSD.h"
+#include "SimG4CMS/Forward/interface/ZdcShowerLibrary.h"
+#include "FWCore/Utilities/interface/Exception.h"
+#include "FWCore/ServiceRegistry/interface/Service.h"
+#include "FWCore/Utilities/interface/RandomNumberGenerator.h"
+#include "SimG4Core/Notification/interface/G4TrackToParticleID.h"
+
+#include "G4VPhysicalVolume.hh"
+#include "G4Step.hh"
+#include "G4Track.hh"
+#include "Randomize.hh"
+#include <CLHEP/Units/SystemOfUnits.h>
+
+using namespace std;
+
+ZdcShowerLibrary::ZdcShowerLibrary(const std::string& name, edm::ParameterSet const& p) {
+  TFile* theFile = new TFile("zdc_lib_treeid_ip2_e5_1000shower.root", "READ");
+  theFile->ls();
+  TTree* event(nullptr);
+  event = (TTree*)theFile->Get("SimHits");
+  emBranch = event->GetBranch("emParticles");
+  emBranch->Print(); 
+
+  hadBranch = event->GetBranch("hadParticles");
+  hadBranch->Print();
+
+  nmomg = 5;
+  evtPerShg = 1000;
+  nmomn = 5;
+  evtPerShn = 1000;
+  nbinx=6; 
+  nbiny=6;
+  totEvents = (nmomg*evtPerShg + nmomn*evtPerShn) * ntotx * ntoty;
+  xbin = {0,10,20,30,40,50};
+  ybin = {0,10,20,30,40,50};
+  pmomg = {50, 100, 200, 400, 800};
+  pmomn = {250, 500, 1000, 2000, 4000};
+}
+
+
+// ============================================================================================
+std::vector<ZdcShowerLibrary::Hit>& ZdcShowerLibrary::getHits(const G4Step* aStep, bool& ok) {
+
+  G4StepPoint* preStepPoint = aStep->GetPreStepPoint();
+  G4ThreeVector Pre = preStepPoint->GetPosition();
+  auto const track = aStep->GetTrack();
+  int parCode = track->GetDefinition()->GetPDGEncoding();
+
+  if (track->GetDefinition()->IsGeneralIon()) {
+    parCode = 1000020040;
+  }
+  double pin = preStepPoint->GetKineticEnergy()/1000;
+  bool isEM = G4TrackToParticleID::isGammaElectronPositron(parCode);
+  // shower is built only for gamma, e+- and stable hadrons
+  if (isEM) { 
+     interpolate(0, fabs(Pre.x()),fabs( Pre.y()), pin);
+  } else {
+     interpolate(1, fabs(Pre.x()),fabs( Pre.y()), pin);
+  }
+
+  return hits;
+}
+
+// ============================================================================================
+void ZdcShowerLibrary::interpolate(int type, double xin, double yin, double pin) {
+
+  int ims = 0, ixs = 0, iys = 0;
+
+  double wx=0, wy=0, wm=0, w=1, rm=0;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+  for (int ix = 0; ix < nbinx - 1; ix++) {  
+     if (xin >= xbin[ix] && xin < xbin[ix+1]) {
+     	wx = (xin-xbin[ix])/(xbin[ix+1]-xbin[ix]);
+     	ixs=ix;
+     }
+  }
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+  for (int iy = 0; iy < nbiny - 1; iy++) {  
+     if (yin >= ybin[iy] && yin < ybin[iy+1]) {
+     	wy = (yin-ybin[iy])/(ybin[iy+1]-ybin[iy]);
+     	iys=iy;
+     }
+  }
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+  if(type==0) {    // gamma   ------------------------------------------------------------------ 
+     if (pin < pmomg[0]) { //                        extrapolate down
+      w = pin / pmomg[0];
+      wm=0;
+      ims=0;
+    } else if (pin > pmomg[nmomg - 1]) { //          extrapolate up
+      w = pin / pmomg[nmomg - 1];
+      w=1;
+      ims=nmomg-2;
+    } else {   //                                    interpolate
+      w=1;
+      for (int j = 0; j < nmomg - 1; j++) {
+  	if (pin >= pmomg[j] && pin < pmomg[j + 1]) {
+  	  wm = (pin - pmomg[j]) / (pmomg[j + 1] - pmomg[j]);
+	  rm=pmomg[j + 1] / pmomg[j];
+	  ims=j; 
+  	}
+      }
+    }
+
+  } else {    // neutron  ------------------------------------------------------------------
+     if (pin < pmomn[0]) { //                        extrapolate down
+      w = pin / pmomn[0];
+      wm=0;
+      ims=0;
+    } else if (pin > pmomn[nmomn - 1]) { //          extrapolate up
+      w = pin / pmomn[nmomn - 1];
+      wm=1;
+      ims=nmomn-2;
+    } else {    //                                   interpolate
+      w=1;
+      for (int j = 0; j < nmomn - 1; j++) {
+  	if (pin >= pmomn[j] && pin < pmomn[j + 1]) {
+  	  wm = (pin - pmomn[j]) / (pmomn[j + 1] - pmomn[j]);
+	  rm=pmomn[j + 1] / pmomn[j];
+	  ims=j; 
+  	}
+      }
+    }
+  }
+
+  double ww[9];
+  ww[0] = 0;
+  ww[1] = ww[0] + (1-wm)*(1-wx)*(1-wy);
+  ww[2] = ww[1] + (1-wm)*(1-wx)*wy;
+  ww[3] = ww[2] + (1-wm)*wx*(1-wy); 
+  ww[4] = ww[3] + (1-wm)*wx*wy; 
+  ww[5] = ww[4] + wm*(1-wx)*(1-wy); 
+  ww[6] = ww[5] + wm*(1-wx)*wy; 
+  ww[7] = ww[6] + wm*wx*(1-wy); 
+  ww[8] = ww[7] + wm*wx*wy;  
+  
+  int nshm0 = ims*nbinx*nbiny*evtPerShg;
+  int nshm1 = (ims+1)*nbinx*nbiny*evtPerShg;
+  int nshx0=ixs*nbiny*evtPerShg;
+  int nshx1=(ixs+1)*nbiny*evtPerShg;
+
+
+  int irc[8];
+  irc[0] = nshm0 + nshx0 + iys*evtPerShg;
+  irc[1] = nshm0 + nshx0 + (iys+1)*evtPerShg;
+  irc[2] = nshm0 + nshx1 + iys*evtPerShg;
+  irc[3] = nshm0 + nshx1 + (iys+1)*evtPerShg;
+  irc[4] = nshm1 + nshx0 + iys*evtPerShg;
+  irc[5] = nshm1 + nshx0 + (iys+1)*evtPerShg;
+  irc[6] = nshm1 + nshx1 + iys*evtPerShg;
+  irc[7] = nshm1 + nshx1 + (iys+1)*evtPerShg;
+  
+  double r = G4UniformRand();
+  int ir=-1;
+  for (int i = 0; i < 8; i++) {
+     if(r>ww[i] && r<ww[i+1]) {
+	ir=irc[i]+evtPerShg*r;
+	if(i<4) {
+	  if (pin > pmomn[0]) w=wm*(rm-1)+1;
+	} else {
+	  if (pin < pmomn[nmomn - 1])  w=wm*(1-1/rm)+1/rm;
+	}
+     	getRecord(type, ir, w);
+	continue;	 
+     }
+  }
+}
+
+// =================================================================================================
+//void ZdcShowerLibrary::getRecord(int type, int record) {
+void ZdcShowerLibrary::getRecord(int type, int nrc, double w) {
+  ZdcShowerLibrary::Hit hit;  
+  if (type == 0) {  // gamma
+     std::vector<int> t;   // shower with nhits*3 values
+     std::vector<int>* tp = &t;
+     emBranch->SetAddress(&tp);
+     emBranch->GetEntry(nrc);
+     int tSize = t.size() / 3;  
+     hits.reserve(tSize);
+     hits.clear();
+
+     for (int i = 0; i < tSize; i++) { 
+       hit.detID = t[i];
+       hit.energy = (t[1 * tSize + i])*w,
+       hit.time = t[2 * tSize + i];
+       if(hit.energy>0) hits.push_back(hit);
+     }
+  } else {
+     std::vector<int> t;
+     std::vector<int>* tp = &t;
+     hadBranch->SetAddress(&tp);
+     hadBranch->GetEntry(nrc);
+     int tSize = t.size() / 3;
+     hits.reserve(tSize);
+     hits.clear();
+
+     for (int i = 0; i < tSize; i++) {
+       hit.detID = t[i];
+       hit.energy = (t[1 * tSize + i])*w,
+       hit.time = t[2 * tSize + i];
+       if(hit.energy>0) hits.push_back(hit);
+     }
+  }
+}
